@@ -1,144 +1,127 @@
-import os, math, argparse, json
+# src/train_lm.py
+import math
+import os
+import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
-from utils import set_seed, CosineWithWarmup, JSONLLogger
-from model import EncoderOnlyLM, make_causal_mask
+import argparse
+import random
+import numpy as np
+from model import EncoderOnlyLM, Seq2SeqTransformer
 
+# ---------------------------
+# Dataset
+# ---------------------------
 class CharDataset(Dataset):
-    def __init__(self, path, block_size=256, split='train'):
-        text = open(path, 'r', encoding='utf-8').read()
-        n = len(text)
-        n_train = int(0.9 * n)
-        n_val   = int(0.05 * n)
-        if split == 'train':
-            text = text[:n_train]
-        elif split == 'val':
-            text = text[n_train:n_train+n_val]
-        else:
-            text = text[n_train+n_val:]
-
-        self.chars = sorted(list(set(text)))
-        self.stoi = {ch:i for i,ch in enumerate(self.chars)}
-        self.itos = {i:ch for ch,i in self.stoi.items()}
-        self.vocab_size = len(self.chars)
-        self.data = [self.stoi[c] for c in text]
+    def __init__(self, text, block_size):
+        chars = sorted(list(set(text)))
+        self.vocab_size = len(chars)
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for i, ch in enumerate(chars)}
         self.block_size = block_size
+        self.data = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
 
     def __len__(self):
-        return max(0, len(self.data) - self.block_size - 1)
+        return len(self.data) - self.block_size
 
     def __getitem__(self, idx):
-        chunk = self.data[idx: idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
+        x = self.data[idx: idx + self.block_size]
+        y = self.data[idx + 1: idx + 1 + self.block_size]
         return x, y
 
-def save_checkpoint(model, optimizer, step, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'step': step
-    }, path)
-
+# ---------------------------
+# Train loop
+# ---------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data_path', type=str, default='data/tiny_shakespeare_sample.txt')
-    ap.add_argument('--out_dir', type=str, default='results/lm_base')
-    ap.add_argument('--seed', type=int, default=3407)
-    ap.add_argument('--batch_size', type=int, default=64)
-    ap.add_argument('--block_size', type=int, default=256)
-    ap.add_argument('--d_model', type=int, default=256)
-    ap.add_argument('--n_head', type=int, default=4)
-    ap.add_argument('--n_layer', type=int, default=4)
-    ap.add_argument('--ffn_hidden', type=int, default=1024)
-    ap.add_argument('--lr', type=float, default=3e-4)
-    ap.add_argument('--warmup_steps', type=int, default=200)
-    ap.add_argument('--max_steps', type=int, default=2500)
-    ap.add_argument('--grad_clip', type=float, default=1.0)
-    ap.add_argument('--no_positional_encoding', action='store_true')
+    ap.add_argument("--data_path", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, default="results/lm_base")
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--block_size", type=int, default=256)
+    ap.add_argument("--d_model", type=int, default=256)
+    ap.add_argument("--n_head", type=int, default=4)
+    ap.add_argument("--n_layer", type=int, default=4)
+    ap.add_argument("--ffn_hidden", type=int, default=1024)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--max_steps", type=int, default=2500)
+    ap.add_argument("--seed", type=int, default=3407)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--use_rope", action="store_true", help="Enable Rotary Position Embedding (RoPE)")
+    ap.add_argument("--no_sdpa", action="store_true", help="Disable SDPA/FlashAttention acceleration")
+    ap.add_argument("--use_decoder", action="store_true", help="Use decoder-only mode (experimental)")
     args = ap.parse_args()
 
-    set_seed(args.seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    train_ds = CharDataset(args.data_path, block_size=args.block_size, split='train')
-    val_ds   = CharDataset(args.data_path, block_size=args.block_size, split='val')
-
-    model = EncoderOnlyLM(
-        vocab_size=train_ds.vocab_size,
-        d_model=args.d_model,
-        n_head=args.n_head,
-        n_layer=args.n_layer,
-        ffn_hidden=args.ffn_hidden,
-        max_len=args.block_size+1,
-        dropout=0.1,
-        use_positional=(not args.no_positional_encoding)
-    ).to(device)
-
-    print(f"Vocab size: {train_ds.vocab_size}, Parameters: {sum(p.numel() for p in model.parameters())/1e6:.3f}M")
-
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
-    sched = CosineWithWarmup(opt, warmup_steps=args.warmup_steps, max_steps=args.max_steps)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
-
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
-    logger = JSONLLogger(os.path.join(args.out_dir, 'train_log.jsonl'))
+
+    text = open(args.data_path, encoding="utf-8").read()
+    dataset = CharDataset(text, args.block_size)
+    n = int(0.9 * len(dataset))
+    train_ds, val_ds = torch.utils.data.random_split(dataset, [n, len(dataset) - n])
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.use_decoder:
+        print("⚙️ Using decoder-only (Seq2SeqTransformer with tied src=tgt)")
+        model = Seq2SeqTransformer(
+            src_vocab=dataset.vocab_size, tgt_vocab=dataset.vocab_size,
+            d_model=args.d_model, n_head=args.n_head, n_layer=args.n_layer,
+            ffn_hidden=args.ffn_hidden, max_len=args.block_size + 1,
+            dropout=args.dropout, use_rope=args.use_rope, use_sdpa=not args.no_sdpa
+        )
+    else:
+        model = EncoderOnlyLM(
+            vocab_size=dataset.vocab_size,
+            d_model=args.d_model, n_head=args.n_head, n_layer=args.n_layer,
+            ffn_hidden=args.ffn_hidden, max_len=args.block_size + 1,
+            dropout=args.dropout, use_positional=True,
+            use_rope=args.use_rope, use_sdpa=not args.no_sdpa
+        )
+
+    model = model.to(device)
+    print(f"Vocab size: {dataset.vocab_size}, Parameters: {sum(p.numel() for p in model.parameters())/1e6:.3f}M")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.max_steps)
 
     step = 0
-    best_val = float('inf')
-    ce = nn.CrossEntropyLoss()
-
+    model.train()
     while step < args.max_steps:
-        model.train()
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
-            # causal mask: [B,1,T,T]
-            T = xb.size(1)
-            causal = make_causal_mask(T, device=device)
-            logits = model(xb, src_mask=causal)
-            loss = ce(logits.view(-1, logits.size(-1)), yb.view(-1))
-
-            opt.zero_grad(set_to_none=True)
+            opt.zero_grad()
+            logits = model(xb)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1))
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            sched.step()
+            scheduler.step()
 
             if step % 50 == 0:
-                model.eval()
                 with torch.no_grad():
-                    vloss_total, vcount = 0.0, 0
+                    model.eval()
+                    val_losses = []
                     for xvb, yvb in val_loader:
                         xvb, yvb = xvb.to(device), yvb.to(device)
-                        T = xvb.size(1)
-                        causal_v = make_causal_mask(T, device=device)
-                        v_logits = model(xvb, src_mask=causal_v)
-                        v_loss = ce(v_logits.view(-1, v_logits.size(-1)), yvb.view(-1))
-                        vloss_total += v_loss.item()
-                        vcount += 1
-                vloss = vloss_total / max(1, vcount)
-                ppl = math.exp(min(20, vloss))
-                lr_now = sched.get_last_lr()[0]
-                print(f"step {step:5d} | train {loss.item():.3f} | val {vloss:.3f} | ppl {ppl:.1f} | lr {lr_now:.6f}")
-
-                logger.log(step=step, train_loss=float(loss.item()), val_loss=float(vloss), ppl=float(ppl), lr=float(lr_now))
-
-                if vloss < best_val:
-                    best_val = vloss
-                    save_checkpoint(model, opt, step, os.path.join(args.out_dir, 'best.pt'))
-
+                        logits = model(xvb)
+                        val_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yvb.view(-1))
+                        val_losses.append(val_loss.item())
+                    model.train()
+                    vloss = sum(val_losses) / len(val_losses)
+                    print(f"step {step:5d} | train {loss.item():.3f} | val {vloss:.3f} | ppl {math.exp(vloss):.1f}")
             step += 1
             if step >= args.max_steps:
                 break
 
-    # save final
-    save_checkpoint(model, opt, step, os.path.join(args.out_dir, 'final.pt'))
-    logger.close()
+    torch.save(model.state_dict(), os.path.join(args.out_dir, "final.pt"))
+    print("✅ Training complete. Model saved at:", os.path.join(args.out_dir, "final.pt"))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
